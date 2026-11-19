@@ -16,7 +16,18 @@ To add an OS, create `platform/<os>/` and add a `cfg(target_os)` dependency and 
 
 ## Build
 
+Requires Rust 1.95 or later from rustup.
+
 ```sh
 cargo build --workspace
+cargo test --workspace
 cargo run -p sys-manager
 ```
+
+## Package the macOS app
+
+```sh
+platform/macos/packaging/build-app.sh
+```
+
+This writes `target/dist/Sys Manager.app` and `target/dist/Sys-Manager-<version>.dmg`. Signing, notarization, and install steps are in [`platform/macos/packaging/README.md`](platform/macos/packaging/README.md).

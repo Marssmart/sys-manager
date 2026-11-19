@@ -5,3 +5,11 @@ edition.workspace = true
 
 [dependencies]
 sys-manager-common = { path = "../../common" }
+libc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+sysinfo = { version = "0.40", default-features = false, features = ["system", "user"] }
+
+[dev-dependencies]
+tempfile = "3"
