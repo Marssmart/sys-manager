@@ -1,0 +1,10 @@
+[package]
+name = "sys-manager"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sys-manager-common = { path = "../common" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sys-manager-platform-macos = { path = "../platform/macos" }
