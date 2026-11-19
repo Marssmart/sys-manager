@@ -30,4 +30,4 @@ cargo run -p sys-manager
 platform/macos/packaging/build-app.sh
 ```
 
-This writes `target/dist/Sys Manager.app` and `target/dist/Sys-Manager-<version>.dmg`. Signing, notarization, and install steps are in [`platform/macos/packaging/README.md`](platform/macos/packaging/README.md).
+This writes `target/dist/Sys Manager.app`, a zipped copy of it and `target/dist/Sys-Manager-<version>.dmg`. Pushing a `v*` tag runs the release workflow, which publishes these files as a GitHub Release. Release steps, first-launch instructions for unsigned builds, and signing and notarization are in [`platform/macos/packaging/README.md`](platform/macos/packaging/README.md).

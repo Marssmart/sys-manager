@@ -1,0 +1,98 @@
+name: Release macOS app
+
+# Builds a universal "Sys Manager.app" (ad-hoc signed, not notarized) as a zip and a dmg.
+# Version tags (v*) also publish a GitHub Release with both files attached.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Sys Manager.app
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read version from tag
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+            echo "::error::Tag $TAG must look like v1.2.3."
+            exit 1
+          fi
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install latest stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustc --version
+
+      - name: Build universal app, zip and dmg
+        env:
+          UNIVERSAL: "1"
+        run: platform/macos/packaging/build-app.sh
+
+      - name: Upload zip and dmg
+        uses: actions/upload-artifact@v7
+        with:
+          name: sys-manager-macos
+          path: |
+            target/dist/*.app.zip
+            target/dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download zip and dmg
+        uses: actions/download-artifact@v8
+        with:
+          name: sys-manager-macos
+          path: dist
+
+      - name: Write release notes
+        run: |
+          cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
+          Sys Manager is not signed with a Developer ID or notarized, so macOS blocks it the first time you open it.
+
+          **Files**
+
+          - `Sys-Manager-<version>.app.zip`: the app bundle. Unzip it and move **Sys Manager.app** to Applications.
+          - `Sys-Manager-<version>.dmg`: a disk image. Open it and drag **Sys Manager** into Applications.
+
+          **First launch**
+
+          1. Open **Sys Manager** from Applications. macOS blocks it.
+          2. Open **System Settings → Privacy & Security**, scroll to **Security**, and choose **Open Anyway** next to the message about Sys Manager. If the button is not there, open Sys Manager once more and check again.
+          3. Confirm with your password or Touch ID. If macOS asks again, choose **Open**.
+
+          Sys Manager runs from the menu bar with no Dock icon. It needs macOS 11 or later.
+          EOF
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --verify-tag \
+            --title "Sys Manager $TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
