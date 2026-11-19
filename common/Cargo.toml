@@ -1,0 +1,4 @@
+[package]
+name = "sys-manager-common"
+version.workspace = true
+edition.workspace = true

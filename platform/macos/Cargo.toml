@@ -1,0 +1,7 @@
+[package]
+name = "sys-manager-platform-macos"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sys-manager-common = { path = "../../common" }
