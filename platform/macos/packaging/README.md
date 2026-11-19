@@ -7,7 +7,7 @@
 - macOS 11 or later. The status item uses an SF Symbol, and `LSMinimumSystemVersion` is 11.0.
 - Rust 1.95 or later from rustup. `sysinfo` requires 1.95, so make sure `cargo` on your `PATH` is the rustup one.
 - Xcode Command Line Tools, for the linker.
-- `plutil` and `hdiutil`, which ship with macOS.
+- `plutil`, `hdiutil`, `ditto` and `lipo`, which ship with macOS.
 
 ## Build and package
 
@@ -18,13 +18,17 @@ platform/macos/packaging/build-app.sh
 The script writes:
 
 - `target/dist/Sys Manager.app`
+- `target/dist/Sys-Manager-<version>.app.zip`, the app zipped with `ditto`, which keeps its metadata
 - `target/dist/Sys-Manager-<version>.dmg`
 
-It builds for the host architecture only and does not sign or notarize. The version comes from the workspace `Cargo.toml`.
+It is ad-hoc signed with no certificate. The script does not use a Developer ID or notarize the app. Two optional environment variables change what it builds:
+
+- `UNIVERSAL=1` builds `aarch64-apple-darwin` and `x86_64-apple-darwin` and joins the two binaries with `lipo`. It runs `rustup target add` for both targets first. Without it, the script builds for the host architecture only.
+- `APP_VERSION=<version>` replaces the version from the workspace `Cargo.toml`.
 
 ## Install and run
 
-Open the `.dmg` and drag **Sys Manager** into **Applications**. Or run the bundle directly:
+Open the `.zip` and move **Sys Manager.app** to **Applications**, or open the `.dmg` and drag the app there. Or run the bundle directly:
 
 ```sh
 open "target/dist/Sys Manager.app"
@@ -32,9 +36,35 @@ open "target/dist/Sys Manager.app"
 
 The app has no Dock icon. Quit it from the **Quit** button in the popover.
 
-Unsigned builds that were downloaded are blocked by Gatekeeper. Open **System Settings → Privacy & Security** and choose **Open Anyway**, or sign and notarize the build as described below. A build made on the same Mac runs without this step.
+### First launch of an unsigned build
 
-## Code signing and notarization (not implemented here)
+A downloaded build has no Developer ID signature and is not notarized, so Gatekeeper blocks it the first time it opens:
+
+1. Open **Sys Manager**. macOS blocks it.
+2. Open **System Settings → Privacy & Security**, scroll to **Security**, and choose **Open Anyway** next to the message about Sys Manager. If the button is not there, open the app once more and check again.
+3. Confirm with your password or Touch ID. If macOS asks again, choose **Open**.
+
+A build made on the same Mac runs without these steps. Signing and notarizing the build, described below, also avoids them.
+
+## Release
+
+The **Release macOS app** workflow (`.github/workflows/release-macos.yml`) builds a universal app on a GitHub-hosted macOS runner. Every run uploads the zip and the dmg as the `sys-manager-macos` artifact. A version tag also creates a GitHub Release with both files attached and the first-launch steps in its notes.
+
+To cut a release:
+
+1. Set `version` under `[workspace.package]` in the root `Cargo.toml` to the new version, and merge that change to `main`. The bundle version comes from the tag, but keeping `Cargo.toml` in step avoids a mismatch.
+2. Tag the merged commit and push the tag. The tag must be `v` followed by numbers and dots, such as `v0.1.0`. A suffix such as `-rc1` fails the run.
+
+   ```sh
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+To build without publishing, open the **Actions** tab, choose **Release macOS app**, and select **Run workflow**. Manual runs use the version from `Cargo.toml` and do not create a release. GitHub only offers that button once the workflow file is on the default branch.
+
+A run's artifact downloads as one zip that contains the app zip and the dmg. If a release for the tag already exists, the release step fails. Delete that release on GitHub, then re-run the workflow run.
+
+## Developer ID signing and notarization (not implemented here)
 
 These steps need an Apple Developer Program membership. Certificates and credentials stay in your keychain and must never be committed to this repository. The build script does not perform them.
 
