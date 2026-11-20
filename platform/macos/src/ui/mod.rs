@@ -1,6 +1,7 @@
 //! Menu bar controller. Owns the workers and the popover, and runs the AppKit event loop.
 
 mod details;
+mod item_panel;
 mod list;
 mod popover;
 mod views;
@@ -15,11 +16,14 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThr
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSButton};
 use objc2_foundation::{NSObject, NSTimer};
 
+use sys_manager_common::actions::ItemAction;
 use sys_manager_common::model::{AppModel, Notice, Tab};
 
 use crate::disk::{startup_disk_options, DiskScan};
+use crate::items::{open_item, refusal_before_removal, ItemCommand, ItemWorker};
 use crate::process::{ProcessEvent, ProcessWorker};
 
+use item_panel::confirm_removal;
 use popover::Ui;
 
 const TICK_SECONDS: f64 = 0.25;
@@ -28,6 +32,7 @@ pub struct ControllerIvars {
     model: RefCell<AppModel>,
     disk: RefCell<Option<DiskScan>>,
     processes: ProcessWorker,
+    items: ItemWorker,
     ui: OnceCell<Ui>,
     dirty: Cell<bool>,
 }
@@ -86,6 +91,21 @@ define_class!(
             }
         }
 
+        #[unsafe(method(openItem:))]
+        fn open_item_clicked(&self, _sender: Option<&AnyObject>) {
+            self.open_selected();
+        }
+
+        #[unsafe(method(toggleLock:))]
+        fn toggle_lock_clicked(&self, _sender: Option<&AnyObject>) {
+            self.toggle_selected_lock();
+        }
+
+        #[unsafe(method(removeItem:))]
+        fn remove_item_clicked(&self, _sender: Option<&AnyObject>) {
+            self.remove_selected();
+        }
+
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: Option<&AnyObject>) {
             let mtm = MainThreadMarker::new().expect("actions run on the main thread");
@@ -105,12 +125,13 @@ impl AppController {
             model: RefCell::new(AppModel::default()),
             disk: RefCell::new(None),
             processes: ProcessWorker::start(),
+            items: ItemWorker::start(),
             ui: OnceCell::new(),
             dirty: Cell::new(true),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         let owner = this.clone();
-        let on_row_click: Rc<dyn Fn(isize)> = Rc::new(move |pid| owner.select_process(pid));
+        let on_row_click: Rc<dyn Fn(isize)> = Rc::new(move |tag| owner.select_row(tag));
         let target: &AnyObject = &this;
         let ui = Ui::build(mtm, target, on_row_click);
         let _ = this.ivars().ui.set(ui);
@@ -156,10 +177,100 @@ impl AppController {
         ivars.processes.kill(pid, name);
     }
 
-    fn select_process(&self, pid: isize) {
+    /// Selects the disk item or process whose row was clicked. A disk row's tag is its index in the list.
+    fn select_row(&self, tag: isize) {
         let ivars = self.ivars();
-        if let Ok(pid) = u32::try_from(pid) {
-            ivars.model.borrow_mut().toggle_selection(pid);
+        {
+            let mut model = ivars.model.borrow_mut();
+            match model.tab() {
+                Tab::DiskCleaner => {
+                    if let Ok(index) = usize::try_from(tag) {
+                        model.toggle_item(index);
+                    }
+                }
+                Tab::Processes => {
+                    if let Ok(pid) = u32::try_from(tag) {
+                        model.toggle_selection(pid);
+                    }
+                }
+            }
+        }
+        ivars.dirty.set(true);
+        self.render_if_visible();
+    }
+
+    fn open_selected(&self) {
+        let ivars = self.ivars();
+        let path = {
+            let model = ivars.model.borrow();
+            if model.pending_item().is_some() {
+                return;
+            }
+            match model.selected_item() {
+                Some(entry) => entry.path.clone(),
+                None => return,
+            }
+        };
+        let result = open_item(&path);
+        ivars
+            .model
+            .borrow_mut()
+            .report_item_result(ItemAction::Open, &path, &result);
+        ivars.dirty.set(true);
+        self.render_if_visible();
+    }
+
+    fn toggle_selected_lock(&self) {
+        let ivars = self.ivars();
+        let (path, action) = {
+            let model = ivars.model.borrow();
+            if model.pending_item().is_some() {
+                return;
+            }
+            match model.selected_item() {
+                Some(entry) if entry.locked => (entry.path.clone(), ItemAction::Unlock),
+                Some(entry) => (entry.path.clone(), ItemAction::Lock),
+                None => return,
+            }
+        };
+        ivars.model.borrow_mut().start_item_action(action, &path);
+        ivars.items.submit(ItemCommand::SetLocked {
+            path,
+            locked: action == ItemAction::Lock,
+        });
+        ivars.dirty.set(true);
+        self.render_if_visible();
+    }
+
+    /// Refuses what the disk list can already see is blocked, then asks before moving the item to the Trash.
+    fn remove_selected(&self) {
+        let ivars = self.ivars();
+        let entry = {
+            let model = ivars.model.borrow();
+            if model.pending_item().is_some() || !model.can_change_items() {
+                return;
+            }
+            match model.selected_item() {
+                Some(entry) => entry.clone(),
+                None => return,
+            }
+        };
+        if let Some(refusal) = refusal_before_removal(&entry.path, entry.locked) {
+            ivars.model.borrow_mut().report_item_result(
+                ItemAction::Remove,
+                &entry.path,
+                &Err(refusal),
+            );
+        } else {
+            let mtm = MainThreadMarker::new().expect("actions run on the main thread");
+            if !confirm_removal(mtm, &entry) {
+                return;
+            }
+            ivars
+                .model
+                .borrow_mut()
+                .start_item_action(ItemAction::Remove, &entry.path);
+            ivars.items.submit(ItemCommand::Remove(entry.path.clone()));
         }
         ivars.dirty.set(true);
         self.render_if_visible();
@@ -176,6 +287,13 @@ impl AppController {
                     model.set_notice(Some(Notice::for_kill(pid, &name, &result)));
                 }
             }
+            ivars.dirty.set(true);
+        }
+        for event in ivars.items.drain_events() {
+            ivars
+                .model
+                .borrow_mut()
+                .report_item_result(event.action, &event.path, &event.result);
             ivars.dirty.set(true);
         }
         if let Some(scan) = ivars.disk.borrow().as_ref() {

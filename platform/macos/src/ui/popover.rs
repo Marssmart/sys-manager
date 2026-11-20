@@ -14,11 +14,13 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSDateFormatter, NSDateFormatterStyle, NSRectEdge, NSSize, NSString};
 
+use sys_manager_common::actions::ItemAction;
 use sys_manager_common::disk::ScanState;
 use sys_manager_common::format::{format_bytes, format_percent};
 use sys_manager_common::model::{AppModel, Tab};
 
 use super::details::{DetailsView, DETAILS_HEIGHT};
+use super::item_panel::{ItemPanel, ITEM_PANEL_HEIGHT};
 use super::list::{ListView, RowContent, RowSpec};
 use super::views::FlippedView;
 use super::widgets::{button, font, frame, label, set_text, wire, MEDIUM, REGULAR};
@@ -31,6 +33,7 @@ const LIST_TOP: f64 = 96.0;
 const FOOTER_HEIGHT: f64 = 40.0;
 const GAP: f64 = 8.0;
 const DETAILS_TOP: f64 = HEIGHT - FOOTER_HEIGHT - GAP - DETAILS_HEIGHT;
+const ITEM_PANEL_TOP: f64 = HEIGHT - FOOTER_HEIGHT - GAP - ITEM_PANEL_HEIGHT;
 const INDENT: f64 = 22.0;
 
 pub struct Ui {
@@ -44,6 +47,7 @@ pub struct Ui {
     action: Retained<NSButton>,
     list: ListView,
     details: DetailsView,
+    item_panel: ItemPanel,
     date_format: Retained<NSDateFormatter>,
 }
 
@@ -105,6 +109,13 @@ impl Ui {
         );
         root.addSubview(details.group());
 
+        let item_panel = ItemPanel::new(
+            mtm,
+            frame(PAD, ITEM_PANEL_TOP, WIDTH - 2.0 * PAD, ITEM_PANEL_HEIGHT),
+            target,
+        );
+        root.addSubview(item_panel.group());
+
         let quit = button(mtm, "Quit", Some(target), Some(sel!(quit:)));
         quit.setFrame(frame(WIDTH - PAD - 64.0, HEIGHT - 33.0, 64.0, 24.0));
         root.addSubview(&quit);
@@ -148,6 +159,7 @@ impl Ui {
             action,
             list,
             details,
+            item_panel,
             date_format,
         }
     }
@@ -198,15 +210,22 @@ impl Ui {
         let scanning = model
             .scan()
             .is_some_and(|scan| scan.state == ScanState::Scanning);
+        let busy = model.pending_item().is_some();
+        let removing = model
+            .pending_item()
+            .is_some_and(|pending| pending.action == ItemAction::Remove);
         self.details.group().setHidden(true);
+        self.item_panel.group().setHidden(false);
         self.list.set_frame(frame(
             PAD,
             LIST_TOP,
             WIDTH - 2.0 * PAD,
-            HEIGHT - FOOTER_HEIGHT - LIST_TOP,
+            ITEM_PANEL_TOP - GAP - LIST_TOP,
         ));
-        self.set_header(&model.disk_title(), &model.disk_detail(), false, scanning);
+        let (status, status_is_error) = model.disk_status_line();
+        self.set_header(&model.disk_title(), &status, status_is_error, scanning);
         self.action.setHidden(false);
+        self.action.setEnabled(!removing);
         if scanning {
             self.action.setTitle(&NSString::from_str("Stop"));
             wire(&self.action, target, sel!(stopScan:));
@@ -214,16 +233,23 @@ impl Ui {
             self.action.setTitle(&NSString::from_str("Rescan"));
             wire(&self.action, target, sel!(rescan:));
         }
+        let selected = model.selected_item();
+        self.item_panel
+            .show(selected, model.can_change_items(), busy);
+        let selected_path = selected.map(|entry| entry.path.as_path());
         let specs: Vec<RowSpec> = model
             .disk_entries()
             .iter()
-            .map(|entry| RowSpec {
+            .enumerate()
+            .map(|(index, entry)| RowSpec {
                 content: RowContent::Item {
                     title: entry.name(),
                     location: entry.location(),
                     size: format_bytes(entry.size),
+                    locked: entry.locked,
                 },
-                selected: false,
+                selected: selected_path == Some(entry.path.as_path()),
+                tag: index as isize,
             })
             .collect();
         let empty = if scanning {
@@ -236,6 +262,7 @@ impl Ui {
 
     fn render_processes(&self, model: &AppModel, target: &AnyObject) {
         self.action.setHidden(true);
+        self.item_panel.group().setHidden(true);
         self.details.group().setHidden(false);
         self.list.set_frame(frame(
             PAD,
@@ -266,13 +293,13 @@ impl Ui {
             .iter()
             .map(|process| RowSpec {
                 content: RowContent::Process {
-                    pid: process.pid as isize,
                     title: process.name.clone(),
                     pid_text: format!("PID {}", process.pid),
                     cpu_text: format!("CPU {}", format_percent(process.cpu_percent)),
                     memory_text: format!("Mem {}", format_bytes(process.memory_bytes)),
                 },
                 selected: selected.is_some_and(|chosen| chosen.pid == process.pid),
+                tag: process.pid as isize,
             })
             .collect();
         self.list.set_rows(&specs, target, "No processes found.");
