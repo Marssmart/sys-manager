@@ -23,12 +23,14 @@ impl ItemAction {
         }
     }
 
-    /// Shown when the action succeeds.
-    pub fn success_text(self, name: &str) -> String {
+    /// Shown when the action succeeds. A folder's lock covers everything inside it, and the text says so.
+    pub fn success_text(self, name: &str, folder: bool) -> String {
         match self {
             Self::Open => format!("Opened “{name}”"),
             Self::Remove => format!("Moved “{name}” to the Trash"),
+            Self::Lock if folder => format!("Locked “{name}” and everything in it"),
             Self::Lock => format!("Locked “{name}”"),
+            Self::Unlock if folder => format!("Unlocked “{name}” and everything in it"),
             Self::Unlock => format!("Unlocked “{name}”"),
         }
     }
@@ -57,6 +59,10 @@ pub enum ActionError {
     LockedParent,
     /// Only the owner of an item may lock or unlock it.
     NotOwner,
+    /// The folder holds a protected system item, given by its path relative to the folder.
+    ProtectedInside(String),
+    /// The folder holds an item that the user doesn't own, given by its path relative to the folder.
+    NotOwnerInside(String),
     /// The item is no longer where the scan found it.
     NotFound,
     /// The system denied access.
@@ -90,6 +96,14 @@ impl fmt::Display for ActionError {
             ),
             Self::LockedParent => write!(f, "Its folder is locked. Unlock the folder first."),
             Self::NotOwner => write!(f, "You can only lock or unlock items you own."),
+            Self::ProtectedInside(relative) => write!(
+                f,
+                "It contains a protected system item, “{relative}”. Nothing was changed."
+            ),
+            Self::NotOwnerInside(relative) => write!(
+                f,
+                "It contains “{relative}”, which you don't own. Nothing was changed."
+            ),
             Self::NotFound => write!(f, "It's no longer there. Rescan to refresh the list."),
             Self::PermissionDenied => write!(
                 f,

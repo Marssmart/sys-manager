@@ -148,27 +148,128 @@ fn first_locked_inside(root: &Path) -> Result<Option<String>, ActionError> {
     Ok(None)
 }
 
-/// Sets or clears the lock flag of the item at `path`. Only the owner can change it, and system folders are never locked.
+/// Decides what a lock change may touch. Production uses the system folders and the user's own items. Tests substitute rules of their own.
+struct LockRules<'a> {
+    is_protected: &'a dyn Fn(&Path) -> bool,
+    is_owned: &'a dyn Fn(&Path, &Metadata) -> bool,
+}
+
+/// Locks or unlocks the item at `path`, and everything under it when it is a folder. Only the owner can change items, and system locations are never locked.
 ///
 /// `lchflags` changes a symlink's own flags, so a link's target is never locked through it.
 pub fn set_locked(path: &Path, locked: bool, current_uid: u32) -> Result<(), ActionError> {
-    if locked && is_protected(path) {
+    let is_owned = |_: &Path, metadata: &Metadata| metadata.uid() == current_uid;
+    lock_tree(
+        path,
+        locked,
+        &LockRules {
+            is_protected: &is_protected,
+            is_owned: &is_owned,
+        },
+    )
+}
+
+/// Changes `root` and everything under it. The whole tree is checked before anything changes. If a change fails part way, the items already changed are restored.
+fn lock_tree(root: &Path, locked: bool, rules: &LockRules) -> Result<(), ActionError> {
+    if locked && (rules.is_protected)(root) {
         return Err(ActionError::Protected);
     }
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.uid() != current_uid {
-        return Err(ActionError::NotOwner);
-    }
-    let flags = metadata.st_flags();
-    let wanted = if locked {
-        flags | LOCK_FLAG
+    let items = collect_tree(root, locked, rules)?;
+    // Locking goes bottom-up, so each folder closes after its contents. Unlocking goes top-down.
+    let ordered: Vec<&TreeItem> = if locked {
+        items.iter().rev().collect()
     } else {
-        flags & !LOCK_FLAG
+        items.iter().collect()
     };
-    if wanted == flags {
-        return Ok(());
+    let mut changed: Vec<&TreeItem> = Vec::new();
+    for item in ordered {
+        let wanted = if locked {
+            item.flags | LOCK_FLAG
+        } else {
+            item.flags & !LOCK_FLAG
+        };
+        if wanted == item.flags {
+            continue;
+        }
+        if let Err(error) = change_flags(&item.path, wanted) {
+            for done in changed.iter().rev() {
+                let _ = change_flags(&done.path, done.flags);
+            }
+            return Err(ActionError::from(error));
+        }
+        changed.push(item);
     }
-    change_flags(path, wanted)?;
+    Ok(())
+}
+
+/// An item in a tree that is about to change, with the flags it had when it was checked.
+struct TreeItem {
+    path: PathBuf,
+    flags: u32,
+}
+
+/// Lists `root` and everything under it, each folder before its contents. Symlinks are listed but never entered. Refuses on the first item that may not change.
+fn collect_tree(
+    root: &Path,
+    locking: bool,
+    rules: &LockRules,
+) -> Result<Vec<TreeItem>, ActionError> {
+    let root_metadata = fs::symlink_metadata(root)?;
+    check_item(root, root, &root_metadata, locking, rules)?;
+    let mut items = vec![TreeItem {
+        path: root.to_path_buf(),
+        flags: root_metadata.st_flags(),
+    }];
+    let mut folders = Vec::new();
+    if root_metadata.is_dir() {
+        folders.push(root.to_path_buf());
+    }
+    while let Some(folder) = folders.pop() {
+        for entry in fs::read_dir(&folder)? {
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            check_item(&path, root, &metadata, locking, rules)?;
+            if metadata.is_dir() {
+                folders.push(path.clone());
+            }
+            items.push(TreeItem {
+                path,
+                flags: metadata.st_flags(),
+            });
+        }
+    }
+    Ok(items)
+}
+
+/// Refuses an item that the change may not touch. Inside a tree, the refusal names the item.
+fn check_item(
+    path: &Path,
+    root: &Path,
+    metadata: &Metadata,
+    locking: bool,
+    rules: &LockRules,
+) -> Result<(), ActionError> {
+    let inside = path != root;
+    let relative = || {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    };
+    if locking && (rules.is_protected)(path) {
+        return Err(if inside {
+            ActionError::ProtectedInside(relative())
+        } else {
+            ActionError::Protected
+        });
+    }
+    if !(rules.is_owned)(path, metadata) {
+        return Err(if inside {
+            ActionError::NotOwnerInside(relative())
+        } else {
+            ActionError::NotOwner
+        });
+    }
     Ok(())
 }
 
@@ -417,6 +518,8 @@ mod tests {
         write_file(&file);
         set_locked(&folder, true, current_uid()).unwrap();
         let _unlock = UnlockOnDrop(folder.clone());
+        // Clearing the file's own flag leaves the locked folder as the only blocker.
+        set_locked(&file, false, current_uid()).unwrap();
 
         assert_eq!(remove_item(&file, &trash), Err(ActionError::LockedParent));
         assert!(trash.calls().is_empty());
@@ -494,5 +597,150 @@ mod tests {
             Err(ActionError::NotOwner)
         );
         assert!(!is_locked(&fs::symlink_metadata(&file).unwrap()));
+    }
+
+    fn locked(path: &Path) -> bool {
+        is_locked(&fs::symlink_metadata(path).unwrap())
+    }
+
+    #[test]
+    fn locking_a_nested_tree_locks_every_file_and_subfolder() {
+        let dir = TempDir::new().unwrap();
+        let tree = dir.path().join("tree");
+        let deep = tree.join("sub/deep");
+        fs::create_dir_all(&deep).unwrap();
+        write_file(&tree.join("top.txt"));
+        write_file(&tree.join("sub/middle.txt"));
+        write_file(&deep.join("bottom.txt"));
+        let _unlock = UnlockOnDrop(tree.clone());
+
+        set_locked(&tree, true, current_uid()).unwrap();
+
+        let items = [
+            tree.clone(),
+            tree.join("top.txt"),
+            tree.join("sub"),
+            tree.join("sub/middle.txt"),
+            deep.clone(),
+            deep.join("bottom.txt"),
+        ];
+        for item in items {
+            assert!(locked(&item), "{} should be locked", item.display());
+        }
+    }
+
+    #[test]
+    fn creating_a_file_in_a_locked_subfolder_fails() {
+        let dir = TempDir::new().unwrap();
+        let tree = dir.path().join("tree");
+        let sub = tree.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let _unlock = UnlockOnDrop(tree.clone());
+        set_locked(&tree, true, current_uid()).unwrap();
+
+        let error = fs::write(sub.join("new.txt"), b"new").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!sub.join("new.txt").exists());
+    }
+
+    #[test]
+    fn unlocking_restores_removal_throughout_the_tree() {
+        let dir = TempDir::new().unwrap();
+        let trash = FakeTrash::new(&dir);
+        let folder = dir.path().join("folder");
+        fs::create_dir_all(folder.join("sub")).unwrap();
+        write_file(&folder.join("sub/file.txt"));
+        let _unlock = UnlockOnDrop(folder.clone());
+        set_locked(&folder, true, current_uid()).unwrap();
+        assert_eq!(remove_item(&folder, &trash), Err(ActionError::Locked));
+
+        set_locked(&folder, false, current_uid()).unwrap();
+
+        assert!(!locked(&folder.join("sub")));
+        assert!(!locked(&folder.join("sub/file.txt")));
+        assert_eq!(remove_item(&folder, &trash), Ok(()));
+        assert!(trash.folder.join("folder/sub/file.txt").exists());
+    }
+
+    #[test]
+    fn symlinks_in_a_locked_tree_are_locked_as_links_and_their_targets_are_untouched() {
+        let dir = TempDir::new().unwrap();
+        let tree = dir.path().join("tree");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&tree).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let outside_file = outside.join("keep.txt");
+        write_file(&outside_file);
+        let folder_link = tree.join("folder-link");
+        let file_link = tree.join("file-link");
+        symlink(&outside, &folder_link).unwrap();
+        symlink(&outside_file, &file_link).unwrap();
+        let _unlock = UnlockOnDrop(tree.clone());
+
+        set_locked(&tree, true, current_uid()).unwrap();
+
+        assert!(locked(&folder_link));
+        assert!(locked(&file_link));
+        assert!(!locked(&outside));
+        assert!(!locked(&outside_file));
+    }
+
+    #[test]
+    fn a_tree_holding_a_protected_item_refuses_the_lock_and_changes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let tree = dir.path().join("tree");
+        let protected = tree.join("sub/protected.txt");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        write_file(&tree.join("open.txt"));
+        write_file(&protected);
+        let _unlock = UnlockOnDrop(tree.clone());
+        let rules = LockRules {
+            is_protected: &|path: &Path| path == protected,
+            is_owned: &|_: &Path, _: &Metadata| true,
+        };
+
+        let result = lock_tree(&tree, true, &rules);
+
+        assert_eq!(
+            result,
+            Err(ActionError::ProtectedInside(
+                "sub/protected.txt".to_string()
+            ))
+        );
+        let items = [
+            tree.clone(),
+            tree.join("open.txt"),
+            tree.join("sub"),
+            protected.clone(),
+        ];
+        for item in items {
+            assert!(!locked(&item), "{} should be unchanged", item.display());
+        }
+    }
+
+    #[test]
+    fn a_tree_holding_an_item_you_do_not_own_refuses_the_lock_and_changes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let tree = dir.path().join("tree");
+        let foreign = tree.join("foreign.txt");
+        fs::create_dir(&tree).unwrap();
+        write_file(&tree.join("mine.txt"));
+        write_file(&foreign);
+        let _unlock = UnlockOnDrop(tree.clone());
+        let rules = LockRules {
+            is_protected: &|_: &Path| false,
+            is_owned: &|path: &Path, _: &Metadata| path != foreign,
+        };
+
+        let result = lock_tree(&tree, true, &rules);
+
+        assert_eq!(
+            result,
+            Err(ActionError::NotOwnerInside("foreign.txt".to_string()))
+        );
+        assert!(!locked(&tree));
+        assert!(!locked(&tree.join("mine.txt")));
+        assert!(!locked(&foreign));
     }
 }

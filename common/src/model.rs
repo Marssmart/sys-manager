@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::actions::{ActionError, ItemAction};
-use crate::disk::{display_name, ScanEntry, ScanSnapshot, ScanState};
+use crate::disk::{display_name, EntryKind, ScanEntry, ScanSnapshot, ScanState};
 use crate::format::{format_bytes, format_count};
 use crate::process::{sort_for_display, KillError, ProcessInfo};
 
@@ -36,10 +36,15 @@ impl Notice {
     }
 
     /// Describes the outcome of an action on a disk item.
-    pub fn for_item(action: ItemAction, name: &str, result: &Result<(), ActionError>) -> Self {
+    pub fn for_item(
+        action: ItemAction,
+        name: &str,
+        folder: bool,
+        result: &Result<(), ActionError>,
+    ) -> Self {
         match result {
             Ok(()) => Self {
-                text: action.success_text(name),
+                text: action.success_text(name, folder),
                 is_error: false,
             },
             Err(error) => Self {
@@ -201,6 +206,10 @@ impl AppModel {
         path: &Path,
         result: &Result<(), ActionError>,
     ) {
+        let folder = self
+            .disk_entries()
+            .iter()
+            .any(|entry| entry.path == path && entry.kind == EntryKind::Directory);
         if self
             .pending_item
             .as_ref()
@@ -216,7 +225,12 @@ impl AppModel {
                 ItemAction::Unlock => self.set_item_locked(path, false),
             }
         }
-        self.item_notice = Some(Notice::for_item(action, &display_name(path), result));
+        self.item_notice = Some(Notice::for_item(
+            action,
+            &display_name(path),
+            folder,
+            result,
+        ));
     }
 
     pub fn item_notice(&self) -> Option<&Notice> {
@@ -260,13 +274,16 @@ impl AppModel {
         }
     }
 
+    /// Sets the lock flag on the item at `path` and on every listed item under it, because a folder's lock covers its contents.
     fn set_item_locked(&mut self, path: &Path, locked: bool) {
-        if let Some(entry) = self
-            .scan
-            .as_mut()
-            .and_then(|scan| scan.entries.iter_mut().find(|entry| entry.path == path))
-        {
-            entry.locked = locked;
+        if let Some(scan) = self.scan.as_mut() {
+            for entry in scan
+                .entries
+                .iter_mut()
+                .filter(|entry| entry.path.starts_with(path))
+            {
+                entry.locked = locked;
+            }
         }
     }
 
@@ -315,7 +332,6 @@ impl AppModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::EntryKind;
     use std::time::Duration;
 
     fn process(pid: u32) -> ProcessInfo {
@@ -451,5 +467,32 @@ mod tests {
         let notice = model.item_notice().unwrap();
         assert!(notice.is_error);
         assert!(notice.text.ends_with("Locked. Unlock it first."));
+    }
+
+    #[test]
+    fn locking_a_folder_marks_the_listed_items_inside_it() {
+        let mut model = AppModel::default();
+        model.set_scan(disk_snapshot(
+            300,
+            3,
+            vec![
+                disk_entry("/data/cache", 200, 2, EntryKind::Directory),
+                disk_entry("/data/cache/a.bin", 150, 1, EntryKind::File),
+                disk_entry("/data/keep.bin", 100, 1, EntryKind::File),
+            ],
+        ));
+
+        model.report_item_result(ItemAction::Lock, Path::new("/data/cache"), &Ok(()));
+
+        let locked: Vec<bool> = model
+            .disk_entries()
+            .iter()
+            .map(|entry| entry.locked)
+            .collect();
+        assert_eq!(locked, [true, true, false]);
+        assert_eq!(
+            model.item_notice().map(|notice| notice.text.as_str()),
+            Some("Locked “cache” and everything in it")
+        );
     }
 }

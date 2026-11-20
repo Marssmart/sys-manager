@@ -223,7 +223,12 @@ impl Ui {
             ITEM_PANEL_TOP - GAP - LIST_TOP,
         ));
         let (status, status_is_error) = model.disk_status_line();
-        self.set_header(&model.disk_title(), &status, status_is_error, scanning);
+        self.set_header(
+            &model.disk_title(),
+            &status,
+            status_is_error,
+            scanning || busy,
+        );
         self.action.setHidden(false);
         self.action.setEnabled(!removing);
         if scanning {
