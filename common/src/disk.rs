@@ -8,7 +8,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, DirEntry, Metadata, ReadDir};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,6 +30,9 @@ impl CancelToken {
 /// Bytes charged to a file. Each platform supplies the measure that matches its disk accounting.
 pub type SizeMeasure = fn(&Metadata) -> u64;
 
+/// Reports whether a file or folder carries the platform's lock flag. Each platform supplies the check.
+pub type LockProbe = fn(&Metadata) -> bool;
+
 /// Logical length of the file in bytes.
 pub fn apparent_size(metadata: &Metadata) -> u64 {
     metadata.len()
@@ -43,6 +46,8 @@ pub struct ScanOptions {
     /// Maximum number of entries in each snapshot.
     pub top_n: usize,
     pub measure: SizeMeasure,
+    /// Reports the lock flag of each file and folder, so that entries can show it.
+    pub is_locked: LockProbe,
     /// Minimum time between progress snapshots.
     pub report_interval: Duration,
 }
@@ -54,6 +59,7 @@ impl ScanOptions {
             skip: Vec::new(),
             top_n: 200,
             measure: apparent_size,
+            is_locked: |_| false,
             report_interval: Duration::from_millis(250),
         }
     }
@@ -77,15 +83,24 @@ pub struct ScanEntry {
     pub path: PathBuf,
     pub size: u64,
     pub kind: EntryKind,
+    /// Items the scan counted under this entry, including the entry itself.
+    pub items: u64,
+    /// Whether the entry itself carries the lock flag.
+    pub locked: bool,
+}
+
+/// Final path component, such as `Library`.
+pub fn display_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 impl ScanEntry {
     /// Final path component, such as `Library`.
     pub fn name(&self) -> String {
-        self.path.file_name().map_or_else(
-            || self.path.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        )
+        display_name(&self.path)
     }
 
     /// Parent folder, shown under the name.
@@ -146,6 +161,8 @@ struct Ranked {
     // Reversed so that among equal sizes the greater path is evicted first, keeping smaller paths.
     path: Reverse<PathBuf>,
     kind: EntryKind,
+    items: u64,
+    locked: bool,
 }
 
 struct Ranking {
@@ -179,6 +196,10 @@ struct Frame {
     entries: ReadDir,
     /// Bytes found so far under this directory.
     total: u64,
+    /// Items found so far under this directory, not counting the directory itself.
+    items: u64,
+    /// Whether the directory itself carries the lock flag.
+    locked: bool,
     /// The scan root is walked but never ranked.
     rankable: bool,
     /// The entry this frame currently holds in the ranking, if any.
@@ -187,11 +208,12 @@ struct Frame {
 
 /// Brings a frame's ranking entry up to date with its running total.
 fn rank_frame(ranking: &mut Ranking, frame: &mut Frame) {
+    let items = frame.items + 1;
     if !frame.rankable
         || frame
             .ranked
             .as_ref()
-            .is_some_and(|ranked| ranked.size == frame.total)
+            .is_some_and(|ranked| ranked.size == frame.total && ranked.items == items)
     {
         return;
     }
@@ -203,6 +225,8 @@ fn rank_frame(ranking: &mut Ranking, frame: &mut Frame) {
             size: frame.total,
             path: Reverse(frame.path.clone()),
             kind: EntryKind::Directory,
+            items,
+            locked: frame.locked,
         };
         ranking.insert(entry.clone());
         frame.ranked = Some(entry);
@@ -248,11 +272,8 @@ impl<'a> Walk<'a> {
     fn start(&mut self) {
         let root = self.options.root.clone();
         match fs::symlink_metadata(&root) {
-            Ok(metadata) if metadata.is_dir() => self.enter(root, false),
-            Ok(metadata) if metadata.is_file() => {
-                let size = (self.options.measure)(&metadata);
-                self.add_file(root, size);
-            }
+            Ok(metadata) if metadata.is_dir() => self.enter(root, false, false),
+            Ok(metadata) if metadata.is_file() => self.add_file(root, &metadata),
             Ok(_) => {}
             Err(err) => self.record_error(&err),
         }
@@ -274,6 +295,7 @@ impl<'a> Walk<'a> {
 
     fn visit(&mut self, entry: DirEntry) {
         self.items_scanned += 1;
+        self.count_item();
         let path = entry.path();
         self.current_path = Some(path.clone());
         let file_type = match entry.file_type() {
@@ -285,25 +307,31 @@ impl<'a> Walk<'a> {
         }
         if file_type.is_dir() {
             if !self.skip.contains(&path) {
-                self.enter(path, true);
+                let locked = match entry.metadata() {
+                    Ok(metadata) => (self.options.is_locked)(&metadata),
+                    Err(err) => {
+                        self.record_error(&err);
+                        false
+                    }
+                };
+                self.enter(path, true, locked);
             }
         } else if file_type.is_file() {
             match entry.metadata() {
-                Ok(metadata) => {
-                    let size = (self.options.measure)(&metadata);
-                    self.add_file(path, size);
-                }
+                Ok(metadata) => self.add_file(path, &metadata),
                 Err(err) => self.record_error(&err),
             }
         }
     }
 
-    fn enter(&mut self, path: PathBuf, rankable: bool) {
+    fn enter(&mut self, path: PathBuf, rankable: bool, locked: bool) {
         match fs::read_dir(&path) {
             Ok(entries) => self.stack.push(Frame {
                 path,
                 entries,
                 total: 0,
+                items: 0,
+                locked,
                 rankable,
                 ranked: None,
             }),
@@ -317,7 +345,9 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn add_file(&mut self, path: PathBuf, size: u64) {
+    fn add_file(&mut self, path: PathBuf, metadata: &Metadata) {
+        let size = (self.options.measure)(metadata);
+        let locked = (self.options.is_locked)(metadata);
         self.bytes_scanned += size;
         for frame in &mut self.stack {
             frame.total += size;
@@ -327,7 +357,16 @@ impl<'a> Walk<'a> {
                 size,
                 path: Reverse(path),
                 kind: EntryKind::File,
+                items: 1,
+                locked,
             });
+        }
+    }
+
+    /// Counts one entry the walk has reached, in every folder still open on the stack.
+    fn count_item(&mut self) {
+        for frame in &mut self.stack {
+            frame.items += 1;
         }
     }
 
@@ -367,6 +406,8 @@ impl<'a> Walk<'a> {
                     path: ranked.path.0.clone(),
                     size: ranked.size,
                     kind: ranked.kind,
+                    items: ranked.items,
+                    locked: ranked.locked,
                 })
                 .collect(),
             elapsed: self.started.elapsed(),
@@ -530,5 +571,33 @@ mod tests {
         assert_eq!(snapshot.state, ScanState::Completed);
         assert!(snapshot.entries.is_empty());
         assert_eq!(snapshot.other_errors, 1);
+    }
+
+    #[test]
+    fn entries_count_their_items_and_carry_the_lock_flag() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write_file(&root.join("big/a.bin"), 3_000);
+        write_file(&root.join("big/nested/b.bin"), 2_000);
+        write_file(&root.join("big/nested/c.bin"), 1);
+        let options = ScanOptions {
+            is_locked: |metadata| metadata.len() == 1,
+            ..ScanOptions::new(root)
+        };
+
+        let snapshot = run(&options);
+
+        let entry = |name: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.path.ends_with(name))
+                .unwrap()
+        };
+        assert_eq!(entry("big").items, 5);
+        assert_eq!(entry("nested").items, 3);
+        assert_eq!(entry("a.bin").items, 1);
+        assert!(entry("c.bin").locked);
+        assert!(!entry("a.bin").locked);
     }
 }

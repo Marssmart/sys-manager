@@ -8,6 +8,8 @@ use std::thread;
 
 use sys_manager_common::disk::{scan, CancelToken, ScanOptions, ScanSnapshot};
 
+use crate::items::is_locked;
+
 /// Paths the startup disk scan never enters.
 ///
 /// `/System/Volumes/Data` holds the data volume that the firmlinks at `/` already expose
@@ -20,6 +22,7 @@ pub fn startup_disk_options() -> ScanOptions {
     ScanOptions {
         skip: SKIPPED_PATHS.iter().map(PathBuf::from).collect(),
         measure: allocated_size,
+        is_locked,
         ..ScanOptions::new("/")
     }
 }
@@ -74,6 +77,7 @@ impl Drop for DiskScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::items::{current_uid, set_locked, test_support::UnlockOnDrop};
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::Path;
@@ -142,6 +146,42 @@ mod tests {
 
         assert_eq!(metadata.len(), 1);
         assert!(allocated_size(&metadata) > metadata.len());
+    }
+
+    #[test]
+    fn scan_reports_the_lock_flag_of_files_and_folders() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let locked_file = root.join("locked.bin");
+        fs::write(&locked_file, vec![0u8; 5_000]).unwrap();
+        let locked_folder = root.join("locked-folder");
+        fs::create_dir(&locked_folder).unwrap();
+        fs::write(locked_folder.join("inside.bin"), vec![0u8; 7_000]).unwrap();
+        let open_file = root.join("open.bin");
+        fs::write(&open_file, vec![0u8; 6_000]).unwrap();
+        let uid = current_uid();
+        set_locked(&locked_file, true, uid).unwrap();
+        set_locked(&locked_folder, true, uid).unwrap();
+        let _unlock_file = UnlockOnDrop(locked_file.clone());
+        let _unlock_folder = UnlockOnDrop(locked_folder.clone());
+
+        let options = ScanOptions {
+            is_locked,
+            ..ScanOptions::new(root)
+        };
+        let snapshot = scan(&options, &CancelToken::default(), |_| {});
+
+        let locked_of = |path: &Path| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap()
+                .locked
+        };
+        assert!(locked_of(&locked_file));
+        assert!(locked_of(&locked_folder));
+        assert!(!locked_of(&open_file));
     }
 
     #[test]
